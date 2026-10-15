@@ -1,0 +1,69 @@
+std :: #import "std";
+libc :: #import "libc";
+
+ADDR :: "0.0.0.0";
+PORT :: 12345;
+alloc :: std.mem.c_allocator;
+
+main :: -> {
+    server := std.net.tcp.Server.listen(.parse(ADDR), PORT);
+    defer {
+        std.println("Closing TCP Server ...");
+        server.close();
+    };
+
+    libc.printf("Listening on %s:%d\n".ptr, ADDR.ptr, PORT);
+
+    while (true) {
+        libc.printf("[main] Waiting for new connection ...\n".ptr);
+        conn := server.accept().stream;
+
+        libc.printf("[main] New connection: %d\n".ptr, conn.socket.fd);
+
+        data := alloc.alloc(#sizeof(ConnectionHandlerData), #alignof(ConnectionHandlerData))
+            .as(*mut ConnectionHandlerData).{ conn };
+
+        mut thread_id: libc.pthread_t;
+        if libc.pthread_create(&mut thread_id, null, &handle_connection, data) != 0 {
+            alloc.free(data);
+            std.panic("Couldn't create thread");
+        }
+        if libc.pthread_detach(thread_id) != 0 then std.panic("Couldn't detach thread");
+    }
+
+    return 0;
+}
+
+ConnectionHandlerData :: struct {
+    conn: std.net.tcp.Stream;
+}
+
+handle_connection :: (data: ?*mut any) -> ?*mut any {
+    tid := libc.pthread_self();
+
+    data := data.as(*mut ConnectionHandlerData);
+    defer alloc.free(data);
+
+    conn := data.*.conn;
+    cid := conn.socket.fd;
+    defer {
+        libc.printf("[%x] Closing connection %d ...\n".ptr, tid, cid);
+        conn.close();
+    };
+
+    conn.send("Hello from the server\n");
+
+    mut buf: [10 * 1024]u8;
+    while true {
+        libc.printf("[%x] Waiting on connection %d\n".ptr, tid, cid);
+        msg := conn.receive(buf[..]mut) orelse break;
+        libc.printf("[%x] received %zd bytes from connection %d: '%.*s'\n".ptr, tid, msg.len, cid, msg.len, msg.ptr);
+
+        libc.sleep(1);
+
+        sent_len := conn.send(msg);
+        libc.printf("[%x] wrote %zd bytes.\n".ptr, tid, sent_len);
+    }
+
+    return null;
+}

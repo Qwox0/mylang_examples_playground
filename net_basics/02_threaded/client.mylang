@@ -1,0 +1,66 @@
+std :: #import "std";
+libc :: #import "libc";
+
+ADDR :: "127.0.0.1";
+PORT :: 12345;
+alloc :: std.mem.c_allocator;
+
+mut static exiting := false;
+
+main :: -> {
+    libc.printf("Connecting to %s:%d\n".ptr, ADDR.ptr, PORT);
+    stream := std.net.tcp.connect(.parse(ADDR), PORT);
+    defer {
+        std.println("Closing socket ...");
+        //stream.shutdown(.Write);
+        //stream.drain();
+        stream.close();
+    };
+
+    mut receive_thread_id: libc.pthread_t;
+    if libc.pthread_create(&mut receive_thread_id, null, &receive_thread, xx &stream) != 0 {
+        std.panic("Couldn't create thread");
+    }
+    defer {
+        // drain remaining messages from the server
+        exiting = true;
+        stream.shutdown(.Write);
+        libc.pthread_join(receive_thread_id, null);
+    };
+
+    mut buf: [10 * 1024]u8;
+    while true {
+        std.print(" > ");
+        libc.fflush(libc.stdout);
+
+        line := libc.fgets(buf[..]mut.ptr, #sizeof_val(buf), libc.stdin) orelse break;
+        line := []u8.{ ptr=line, len=libc.strlen(line) } |> std.str.trim();
+
+        if std.str.eq(line, "quit") break;
+
+        libc.printf("Sending message: '%.*s'\n".ptr, line.len, line.ptr);
+        stream.send(line);
+    }
+    std.println("Bye");
+}
+
+receive_thread :: (data: ?*mut any) -> ?*mut any {
+    stream := data.as(*std.net.tcp.Stream).*;
+
+    mut buf: [10 * 1024]u8;
+
+    while true {
+        msg := (stream.receive(buf[..]mut) orelse break) |> std.str.trim();
+        //clear_prev_line();
+        libc.printf("Message from the server: '%.*s'\n".ptr, msg.len, msg.ptr);
+    }
+
+    if not exiting  std.println("Server ended the connection");
+
+    return null;
+}
+
+clear_prev_line :: () -> {
+    ESCAPE_CHAR :: 0o33.as(u8);
+    libc.printf("%c[A %c[2K \r".ptr, ESCAPE_CHAR, ESCAPE_CHAR);
+}

@@ -1,0 +1,7 @@
+Connecting to 127.0.0.1:12345
+Message from the server: 'Hello from the server'
+Sending message: 'First message'
+Message from the server: 'First message'
+Sending message: 'Second message'
+Message from the server: 'Second message'
+Closing socket ...

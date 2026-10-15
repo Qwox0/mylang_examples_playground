@@ -1,0 +1,100 @@
+std :: #import "std";
+libc :: #import "libc";
+poll_h :: #import "../../mylang_c_bindings/generated/posix/poll.h.mylang";
+
+ADDR :: "127.0.0.1";
+PORT :: 12345;
+
+main :: -> {
+    server := std.net.tcp.Server.listen(.parse(ADDR), PORT);
+    defer {
+        std.println("Closing TCP Server ...");
+        server.close();
+    };
+
+
+    mut fds := PollFdSet.new();
+
+    fds.&mut.push(server.socket.fd, poll_h.POLLIN);
+
+    mut msg_buf: [10 * 1024]u8;
+
+    while (true) {
+        std.println("\npolling ...");
+        poll_out := fds.&mut.poll(-1);
+        libc.printf("poll_out = %d\n".ptr, poll_out);
+
+        mut fd_idx: u64 = 0;
+        for fd in fds.&.iter() {
+            defer fd_idx += 1;
+            libc.printf("fd #%d %d; revents=%d\n".ptr, fd_idx, fd.fd, fd.revents);
+            if fd.revents == 0 continue;
+
+            if fd.fd == server.socket.fd {
+                conn := server.accept().stream;
+                libc.printf("New connection: %d\n".ptr, conn.socket.fd);
+                fds.&mut.push(conn.socket.fd, poll_h.POLLIN);
+            } else {
+                conn := std.net.tcp.Stream.(.(fd.fd));
+
+                msg := conn.receive(msg_buf[..]mut) orelse {
+                    conn.close();
+                    fds.&mut.remove(fd_idx);
+                    continue;
+                };
+                libc.printf("[%d] received %zd bytes: '%.*s'\n".ptr, fd.fd, msg.len, msg.len, msg.ptr);
+
+                libc.sleep(1);
+
+                sent_len := conn.send(msg);
+                libc.printf("[%d] wrote %zd bytes.\n".ptr, fd.fd, sent_len);
+            }
+        }
+    }
+
+    return 0;
+}
+
+PollFdSet :: struct {
+    //MAX_FDS :: 16;
+    MAX_FDS :: 2;
+
+    buf: [MAX_FDS]poll_h.structs.pollfd;
+    nfds: uint;
+
+    new :: () -> PollFdSet {
+        buf: [MAX_FDS]poll_h.structs.pollfd;
+        .{ buf, nfds=0 }
+    }
+
+    poll :: (self: *mut PollFdSet, timeout: libc.c_int) -> {
+        poll_count := poll_h.poll(self.*.buf[..]mut.ptr, self.*.nfds, timeout);
+        if poll_count == -1 then fail("PollFdSet.poll()"); // TODO: error handling
+        poll_count
+    }
+
+    push :: (self: *mut PollFdSet, fd: libc.c_int, events: libc.c_short) -> {
+        if self.*.nfds >= MAX_FDS then std.panic("TODO");
+        self.*.buf[self.*.nfds] = .{ fd, events, revents=0 };
+        self.*.nfds += 1;
+    }
+
+    iter :: (self: *PollFdSet) -> self.*.buf[..self.*.nfds];
+
+    remove :: (self: *mut PollFdSet, iter_idx: uint) -> {
+        std.assert(iter_idx < self.*.nfds);
+        if iter_idx != self.*.nfds {
+            // swap_remove
+            last := self.*.buf[self.*.nfds - 1];
+            self.*.buf[iter_idx] = last;
+        }
+        self.*.nfds -= 1;
+    }
+}
+
+fail :: (thing: []u8) -> never {
+    errno := libc.get_errno();
+    libc.printf("%.*s failed. %s: %s\n".ptr, thing.len, thing.ptr, libc.strerrorname_np(errno),
+           libc.strerror(errno));
+    std.panic("");
+}

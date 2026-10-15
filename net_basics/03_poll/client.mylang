@@ -1,0 +1,32 @@
+std :: #import "std";
+libc :: #import "libc";
+
+ADDR :: "127.0.0.1";
+PORT :: 12345;
+
+main :: -> {
+    libc.printf("Connecting to %s:%d\n".ptr, ADDR.ptr, PORT);
+    stream := std.net.tcp.connect(.parse(ADDR), PORT);
+    defer {
+        std.println("Closing socket ...");
+        stream.shutdown(.Write);
+        stream.close();
+    };
+
+    mut buf: [10 * 1024]u8;
+    while true {
+        {
+            msg := (stream.receive(buf[..]mut) orelse return) |> std.str.trim();
+            libc.printf("Message from the server: '%.*s'\n".ptr, msg.len, msg.ptr);
+        }
+
+        line := libc.fgets(buf[..]mut.ptr, #sizeof_val(buf), libc.stdin) orelse break;
+        line := []u8.{ ptr=line, len=libc.strlen(line) } |> std.str.trim();
+
+        libc.printf("line = '%.*s'\n".ptr, line.len, line.ptr);
+
+        if std.str.eq(line, "quit") break;
+
+        stream.send(line);
+    }
+}

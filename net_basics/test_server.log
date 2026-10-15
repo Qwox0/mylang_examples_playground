@@ -1,0 +1,12 @@
+Listening on 0.0.0.0:12345
+Waiting for new connection ...
+New connection: 4
+Waiting on connection 4
+received 13 bytes from connection 4: 'First message'
+wrote 13 bytes
+Waiting on connection 4
+received 14 bytes from connection 4: 'Second message'
+wrote 14 bytes
+Waiting on connection 4
+Closing connection 4 ...
+Waiting for new connection ...

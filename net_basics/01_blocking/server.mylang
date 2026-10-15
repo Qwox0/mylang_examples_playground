@@ -1,0 +1,43 @@
+std :: #import "std";
+libc :: #import "libc";
+
+ADDR :: "0.0.0.0";
+PORT :: 12345;
+
+main :: -> {
+    server := std.net.tcp.Server.listen(.parse(ADDR), PORT);
+    defer {
+        std.println("Closing TCP Server ...");
+        server.close();
+    };
+
+    libc.printf("Listening on %s:%d\n".ptr, ADDR.ptr, PORT);
+
+    while (true) {
+        libc.printf("Waiting for new connection ...\n".ptr);
+        conn := server.accept().stream;
+        defer {
+            libc.printf("Closing connection %d ...\n".ptr, conn.socket.fd);
+            conn.close();
+        };
+
+        libc.printf("New connection: %d\n".ptr, conn.socket.fd);
+
+        conn.send("Hello from the server\n");
+
+        mut buf: [10 * 1024]u8;
+        while true {
+            libc.printf("Waiting on connection %d\n".ptr, conn.socket.fd);
+            msg := conn.receive(buf[..]mut) orelse break;
+            libc.printf("received %zd bytes from connection %d: '%.*s'\n".ptr, msg.len, conn.socket.fd, msg.len, msg.ptr);
+
+            libc.sleep(1);
+
+            sent_len := conn.send(msg);
+            libc.printf("wrote %zd bytes\n".ptr, sent_len);
+        }
+    }
+
+    return 0;
+}
+

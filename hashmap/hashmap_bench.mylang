@@ -1,0 +1,185 @@
+std :: #import "std";
+libc :: #import "libc";
+//hashmap_old :: #import "./hashmap_old.mylang";
+//hashmap_generic :: #import "./hashmap_generic.mylang";
+hashmap_generic2 :: #import "./hashmap.mylang";
+hashmap_generic3 :: #import "./hashmap_soa.mylang";
+
+bench :: #import "../bench/bench.mylang";
+
+Key :: i32;
+
+
+main :: -> {
+    {
+        BENCH_RUNS :: 100;
+
+        //mut res0 := BenchResults.{};
+        //mut res1 := BenchResults.{};
+        mut res2 := BenchResults.{};
+        mut res3 := BenchResults.{};
+        for i in 0..BENCH_RUNS {
+            //res0.&mut.add(bench_insert1(hashmap_old.I32ToI32HashMap.EMPTY, buf));
+            //res1.&mut.add(bench_insert1(hashmap_generic.HashMap(i32, i32).EMPTY, buf));
+            res2.&mut.add(bench_insert1(hashmap_generic2.HashMap(i32, i32).EMPTY));
+            res3.&mut.add(bench_insert1(hashmap_generic3.HashMap(i32, i32).EMPTY));
+        }
+        //libc.printf("0: ".ptr); res0.&mut.print();
+        //libc.printf("1: ".ptr); res1.&mut.print();
+        libc.printf("2: ".ptr); res2.&mut.print();
+        libc.printf("3: ".ptr); res3.&mut.print();
+    }
+
+    for _ in 0..4 {
+        //bench_insert2("old", hashmap_old.I32ToI32HashMap.EMPTY, buf);
+        //bench_insert2("  1", hashmap_generic.HashMap(i32, i32).EMPTY);
+        bench_insert2("base ", hashmap_generic2.HashMap(i32, i32).EMPTY);
+        bench_insert2("soa  ", hashmap_generic3.HashMap(i32, i32).EMPTY);
+    }
+}
+
+bench_insert1 :: (empty_map: $Map) -> {
+    N :: 1_000_000;
+    mut rng := std.rng.Sfc64.new(213);
+
+    mut map := empty_map;
+
+    now := std.time.Instant.now();
+
+    bench.black_box(&rng);
+    bench.black_box(&map);
+
+    for _ in 0..N {
+        map.&mut.insert(rng.&mut.next().as(Key), 12345, std.ctx.alloc);
+    }
+
+    elapsed := now.elapsed();
+
+    assert_eq(map.&.size(), 999878);
+
+    //libc.printf("%f s; %d s %d ns\n".ptr, elapsed.as_secs_f(), elapsed.secs, elapsed.nanos);
+    elapsed.as_secs_f()
+}
+
+
+bench_insert2 :: (label: []u8, empty_map: $Map) -> {
+    mut rng := std.rng.Sfc64.new(213);
+
+
+    mut map := empty_map;
+
+    N :: 100_000_000;
+
+    {
+        now := std.time.Instant.now();
+        bench.black_box(&rng);
+        bench.black_box(&map);
+
+        for n in 0..N {
+            map.&mut.insert(rng.&mut.next().as(i32), 0, std.ctx.alloc);
+        }
+
+        elapsed := now.elapsed();
+        result := map.&.size();
+        assert_eq(result, 98841586);
+        libc.printf("%s; ?; InsertHugeInt; 01; insert 100M int; %d; %f; ?\n".ptr, label.ptr, result, elapsed.as_secs_f());
+    }
+
+    {
+        now := std.time.Instant.now();
+        bench.black_box(&map);
+
+        map.&mut.reset();
+
+        elapsed := now.elapsed();
+        result := map.&.size();
+        assert_eq(result, 0);
+        libc.printf("%s; ?; InsertHugeInt; 02; reset 100M int; %d; %f; ?\n".ptr, label.ptr, result, elapsed.as_secs_f());
+    }
+
+    {
+        now := std.time.Instant.now();
+        bench.black_box(&rng);
+        bench.black_box(&map);
+
+        for n in 0..N {
+            map.&mut.insert(rng.&mut.next().as(i32), 0, std.ctx.alloc);
+        }
+
+        elapsed := now.elapsed();
+        result := map.&.size();
+        assert_eq(result, 98843646);
+        libc.printf("%s; ?; InsertHugeInt; 03; insert 100M int again; %d; %f; ?\n".ptr, label.ptr, result, elapsed.as_secs_f());
+    }
+
+    {
+        now := std.time.Instant.now();
+        bench.black_box(&rng);
+        bench.black_box(&map);
+
+        for n in 0..N {
+            val: ?i32 = map.&.get(rng.&mut.next().as(i32));
+            bench.black_box(&val);
+        }
+
+        elapsed := now.elapsed();
+        result := map.&.size();
+        assert_eq(result, 98843646);
+        libc.printf("%s; ?; InsertHugeInt; 04; get 100M int; %d; %f; ?\n".ptr, label.ptr, result, elapsed.as_secs_f());
+    }
+
+    {
+        now := std.time.Instant.now();
+        bench.black_box(&rng);
+        bench.black_box(&map);
+
+        for n in 0..N {
+            val := map.&mut.remove(rng.&mut.next().as(i32));
+            bench.black_box(&val);
+        }
+
+        elapsed := now.elapsed();
+
+        result := map.&.size();
+        assert_eq(result, 96567431);
+        libc.printf("%s; ?; InsertHugeInt; 05; remove 100M int; %d; %f; ?\n".ptr, label.ptr, result, elapsed.as_secs_f());
+
+    }
+}
+
+assert_eq :: (l: $Int, r: Int) -> {
+    if l != r {
+        libc.printf("assert_eq failed : %lu != %lu\n".ptr, l, r);
+        std.panic("assert_eq failed")
+    }
+}
+
+BenchResults :: struct {
+    Time :: f32;
+
+    times: std.Array(Time) = .EMPTY,
+
+    add :: (self: *mut BenchResults, time: Time) -> self.*.times.&mut.push(time, std.ctx.alloc);
+
+    print :: (self: *mut BenchResults) -> {
+        self.*.times.&mut.sort_unstable(&(l, r) -> if l.* < r.*  1 else if l.* > r.* then -1 else 0);
+
+        avg := {
+            mut sum: Time = 0.0;
+            for t in self.*.times.&.as_slice() do sum += t;
+            sum / self.*.times.len.as(Time)
+        };
+
+        median: Time = (self.*.times.&.get(self.*.times.len / 2) orelse std.panic("")).*;
+
+        mut min: Time = (self.*.times.&.first() orelse std.panic("")).*;
+        mut max: Time = (self.*.times.&.first() orelse std.panic("")).*;
+        for t in self.*.times.&.as_slice() {
+            if t < min  min = t;
+            if t > max  max = t;
+        }
+
+        libc.printf("avg = %f ; median = %f ; min = %f ; max = %f\n".ptr, avg, median, min, max);
+
+    }
+}

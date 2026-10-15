@@ -1,0 +1,167 @@
+std :: #import "std";
+libc :: #import "libc";
+poll_h :: #import "../../../../../../mylang_c_bindings/generated/posix/poll.h.mylang";
+
+ADDR :: "127.0.0.1";
+PORT :: 12345;
+
+main :: -> {
+    server := std.net.tcp.Server.listen(.parse(ADDR), PORT);
+    defer {
+        std.println("Closing TCP Server ...");
+        server.close();
+    };
+
+    mut server_fds := PollFdSet.new();
+    server_fds.&mut.push(server.socket.fd, poll_h.POLLIN);
+
+    mut connection_fds := PollFdSet.new();
+
+    mut msg_buf: [10 * 1024]u8;
+
+    while (true) {
+        std.println("\npolling ...");
+        poll_out := connection_fds.&mut.poll(0);
+        libc.printf("poll_out = %d\n".ptr, poll_out);
+
+        mut fd_idx: u64 = 0;
+        for fd in connection_fds.&.iter() {
+            defer fd_idx += 1;
+            libc.printf("fd #%d %d; revents=%d\n".ptr, fd_idx, fd.fd, fd.revents);
+            if fd.revents == 0 continue;
+
+            if fd.fd == server.socket.fd {
+                conn := server.accept().stream;
+                libc.printf("New connection: %d\n".ptr, conn.socket.fd);
+                connection_fds.&mut.push(conn.socket.fd, poll_h.POLLIN);
+            } else {
+                conn := std.net.tcp.Stream.(.(fd.fd));
+
+                msg := conn.receive(msg_buf[..]mut) orelse {
+                    conn.close();
+                    connection_fds.&mut.remove(fd_idx);
+                    continue;
+                };
+                libc.printf("[%d] received %zd bytes: '%.*s'\n".ptr, fd.fd, msg.len, msg.len, msg.ptr);
+
+                libc.sleep(1);
+
+                sent_len := conn.send(msg);
+                libc.printf("[%d] wrote %zd bytes.\n".ptr, fd.fd, sent_len);
+            }
+        }
+    }
+
+    return 0;
+}
+
+PollFdSet :: struct {
+    MAX_FDS :: 16;
+
+    buf: [MAX_FDS]poll_h.structs.pollfd;
+    nfds: uint;
+
+    new :: () -> PollFdSet {
+        buf: [MAX_FDS]poll_h.structs.pollfd;
+        .{ buf, nfds=0 }
+    }
+
+    poll :: (self: *mut PollFdSet, timeout: libc.c_int) -> {
+        poll_count := poll_h.poll(self.*.buf[..]mut.ptr, self.*.nfds, timeout);
+        if poll_count == -1 then fail("PollFdSet.poll()"); // TODO: error handling
+        poll_count
+    }
+
+    push :: (self: *mut PollFdSet, fd: libc.c_int, events: libc.c_short) -> {
+        if self.*.nfds >= MAX_FDS then std.panic("TODO");
+        self.*.buf[self.*.nfds] = .{ fd, events, revents=0 };
+        self.*.nfds += 1;
+    }
+
+    iter :: (self: *PollFdSet) -> self.*.buf[..self.*.nfds];
+
+    remove :: (self: *mut PollFdSet, iter_idx: uint) -> {
+        std.assert(iter_idx < self.*.nfds);
+        if iter_idx != self.*.nfds {
+            // swap_remove
+            last := self.*.buf[self.*.nfds - 1];
+            self.*.buf[iter_idx] = last;
+        }
+        self.*.nfds -= 1;
+    }
+}
+
+fail :: (thing: []u8) -> never {
+    errno := libc.get_errno();
+    libc.printf("%.*s failed. %s: %s\n".ptr, thing.len, thing.ptr, libc.strerrorname_np(errno),
+           libc.strerror(errno));
+    std.panic("");
+}
+
+/*
+std :: #import "std";
+libc :: #import "libc";
+
+pthread_h :: #import "../../../../../../mylang_c_bindings/generated/posix/pthread.h.mylang";
+
+PORT :: 12345;
+alloc :: std.mem.c_allocator;
+
+main :: -> {
+    server := std.net.tcp.Server.listen(.parse("0.0.0.0"), PORT);
+    defer {
+        std.println("Closing TCP Server ...");
+        server.close();
+    };
+
+    while (true) {
+        libc.printf("[main] Waiting for new connection ...\n".ptr);
+        conn := server.accept().stream;
+
+        libc.printf("[main] New connection: %d\n".ptr, conn.socket.fd);
+
+        data := alloc.alloc(#sizeof(ConnectionHandlerData), #alignof(ConnectionHandlerData))
+            .as(*mut ConnectionHandlerData).{ conn };
+
+        mut thread_id: pthread_h.pthread_t;
+        if pthread_h.pthread_create(&mut thread_id, null, &handle_connection, data) != 0 {
+            alloc.free(data);
+            std.panic("Couldn't create thread");
+        }
+        if pthread_h.pthread_detach(thread_id) != 0 then std.panic("Couldn't detach thread");
+    }
+
+    return 0;
+}
+
+ConnectionHandlerData :: struct {
+    conn: std.net.tcp.Stream;
+}
+
+handle_connection :: (data: ?*mut any) -> ?*mut any {
+    tid := pthread_h.pthread_self();
+
+    data := data.as(*mut ConnectionHandlerData);
+    defer alloc.free(data);
+
+    conn := data.*.conn;
+    cid := conn.socket.fd;
+    defer {
+        libc.printf("[%d; %x] Closing connection ...\n".ptr, cid, tid);
+        conn.close();
+    };
+
+    mut buf: [10 * 1024]u8;
+    while true {
+        msg := conn.receive(buf[..]mut) orelse break;
+        libc.printf("[%d; %x] received %zd bytes: '%.*s'\n".ptr, cid, tid, msg.len, msg.len, msg.ptr);
+
+        libc.sleep(1);
+
+        sent_len := conn.send(msg);
+        libc.printf("[%d; %x] wrote %zd bytes.\n".ptr, cid, tid, sent_len);
+    }
+
+    return null;
+}
+ */
