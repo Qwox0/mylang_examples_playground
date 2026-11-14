@@ -1,0 +1,11 @@
+[package]
+name = "channels"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[[bin]]
+name = "send_close_race"
+path = "./send_close_race.rs"
+

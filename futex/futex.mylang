@@ -1,0 +1,322 @@
+std :: #import "std";
+libc :: #import "libc";
+
+linux_sys :: #import "../../mylang_c_bindings/generated/linux/sys/syscall.h.mylang";
+linux_futex :: #import "../../mylang_c_bindings/generated/linux/linux/futex.h.mylang";
+
+FUTEX_FLAGS :: struct {
+    PRIVATE :: linux_futex.FUTEX_PRIVATE_FLAG;
+    CLOCK_REALTIME :: linux_futex.FUTEX_CLOCK_REALTIME;
+}
+
+// TODO: use this
+futex_param4 :: union {
+    timeout: ?*libc.timespec,
+    val2: u32,
+};
+
+futex_syscall :: (uaddr: *u32, futex_op: libc.c_int, val: u32, val2OrTimeout: usize, uaddr2: ?*mut u32, val3: u32) ->
+    libc.syscall(linux_sys.SYS_futex, uaddr, futex_op, val, val2OrTimeout, uaddr2, val3);
+
+futex_wait :: (uaddr: *u32, /*futex_op: libc.c_int,*/ val: u32, timeout: ?*libc.timespec, val3: u32 = linux_futex.FUTEX_BITSET_MATCH_ANY) ->
+    futex_syscall(uaddr, linux_futex.FUTEX_WAIT_BITSET, val, xx timeout, null, val3);
+
+futex_wake :: (uaddr: *u32, /*futex_op: libc.c_int,*/ wake_count: u32, val3: u32 = linux_futex.FUTEX_BITSET_MATCH_ANY) ->
+    futex_syscall(uaddr, linux_futex.FUTEX_WAKE_BITSET, wake_count, 0, null, val3);
+
+futex_requeue :: (uaddr: *u32, /*futex_op: libc.c_int,*/ val: u32, val2: u32, uaddr2: ?*mut u32, cmpval: ?u32 = null) -> {
+    switch cmpval {
+        Some :> futex_syscall(uaddr, linux_futex.FUTEX_CMP_REQUEUE, val, xx val2, uaddr2, cmpval);
+        null :> futex_syscall(uaddr, linux_futex.FUTEX_REQUEUE, val, xx val2, uaddr2, 0);
+    }
+}
+
+futex_wake_op :: (uaddr: *mut u32, /*futex_op: libc.c_int,*/ val: u32, val2: u32, uaddr2: ?*mut u32, val3: u32) ->
+    futex_syscall(uaddr, linux_futex.FUTEX_WAKE_OP, val, xx val2, uaddr2, val3);
+
+futex_waitv :: void; // TODO
+
+/*
+/* FUTEX_ to FLAGS_ */
+static inline unsigned int futex_to_flags(unsigned int op)
+{
+	unsigned int flags = FLAGS_SIZE_32;
+
+	if (!(op & FUTEX_PRIVATE_FLAG))
+		flags |= FLAGS_SHARED;
+
+	if (op & FUTEX_CLOCK_REALTIME)
+		flags |= FLAGS_CLOCKRT;
+
+	if (op & FUTEX_ROBUST_UNLOCK)
+		flags |= FLAGS_ROBUST_UNLOCK;
+
+	if (op & FUTEX_ROBUST_LIST32)
+		flags |= FLAGS_ROBUST_LIST32;
+
+	return flags;
+}
+ */
+
+
+// @BENCH: add CONTENDED state
+// @BENCH: only loads during spin
+Mutex :: struct {
+    is_locked: u32 = UNLOCKED; // bool32
+
+    LOCKED :: true.as(u32);
+    UNLOCKED :: false.as(u32);
+
+    try_lock :: (self: *mut Mutex) -> {
+        res := std.atomic.cmpxchg_strong(self.*.is_locked.&mut, UNLOCKED, LOCKED, .Acquire, .Relaxed);
+        if res == null  Lock.{ mutex=self } else null
+    }
+
+    try_lock_weak :: (self: *mut Mutex) -> {
+        res := std.atomic.cmpxchg_weak(self.*.is_locked.&mut, UNLOCKED, LOCKED, .Acquire, .Relaxed);
+        if res == null  Lock.{ mutex=self } else null
+    }
+
+    try_lock_spinning :: (self: *mut Mutex, mut spins := 100) -> {
+        while spins > 0 {
+            lock := self.try_lock_weak();
+            switch lock { Some :> return lock } else {}
+            spins -= 1;
+        }
+        return null;
+    }
+
+    lock_blocking :: (self: *mut Mutex) -> {
+        loop {
+            basic_lock := self.try_lock_spinning() orelse {
+                futex_wait(self.*.is_locked.&mut, LOCKED, null) |> libc.result().unwrap();
+                continue;
+            };
+            return FutexLock.{ basic_lock };
+        }
+    }
+
+    Lock :: struct {
+        mutex: *mut Mutex;
+        unlock :: (self: Lock) -> std.atomic.store(self.mutex.*.is_locked.&mut, UNLOCKED, .Release);
+    };
+
+    FutexLock :: struct {
+        basic_lock: Lock;
+        unlock :: (self: FutexLock) -> {
+            self.basic_lock.unlock();
+            futex_wake(self.basic_lock.mutex.*.is_locked.&mut, 1) |> libc.result().unwrap();
+        }
+    };
+}
+
+
+main :: -> {
+    std.println("\n========== BASIC FUTEX ==========");
+    {
+        mut futex_val: u32 = 0;
+
+        libc.printf("[main] futex_val = %d\n".ptr, futex_val);
+
+        // thread 1
+        t1 := spawn_with_capture((futex: *mut u32) -> {
+            std.println("[1] start");
+            for i in 1.as(u32)..5 {
+                libc.printf("[1] i = %d\n".ptr, i);
+                libc.sleep(1);
+            }
+
+            res := futex_wake(futex, 1000) |> libc.result().unwrap();
+            libc.printf("[1] futex_wake res = %d\n".ptr, res);
+
+            std.println("[1] exit");
+        }, &mut futex_val).unwrap();
+
+        // thread 2
+        t2 := spawn_with_capture((futex: *mut u32) -> {
+            libc.printf("[2] futex_val = %d\n".ptr, futex.*);
+            std.println("[2] wait on futex");
+            res := futex_wait(futex, 0, null) |> libc.result().unwrap();
+            libc.printf("[2] futex_wait res = %d\n".ptr, res);
+
+            std.println("[2] exit");
+        }, &mut futex_val).unwrap();
+
+        // join
+        libc.pthread_join(t1, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 1 joined");
+        libc.pthread_join(t2, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 2 joined");
+
+        res := futex_wake(&mut futex_val, 1);
+        libc.printf("res = %d\n".ptr, res);
+    }
+
+    /*
+    std.println("\n========== FUTEX Struct ==========");
+    {
+        mut futex_val: u32 = 0;
+
+        libc.printf("[main] futex_val = %d\n".ptr, futex_val);
+
+        // thread 1
+        t1 := spawn_with_capture((futex: *mut u32) -> {
+            std.println("[1] start");
+            for i in 1.as(u32)..5 {
+                libc.printf("[1] i = %d\n".ptr, i);
+                libc.sleep(1);
+            }
+
+            res := futex_wake(futex, 1000) |> libc.result().unwrap();
+            libc.printf("[1] futex_wake res = %d\n".ptr, res);
+
+            std.println("[1] exit");
+        }, &mut futex_val).unwrap();
+
+        // thread 2
+        t2 := spawn_with_capture((futex: *mut u32) -> {
+            libc.printf("[2] futex_val = %d\n".ptr, futex.*);
+            std.println("[2] wait on futex");
+            res := futex_wait(futex, 0, null) |> libc.result().unwrap();
+            libc.printf("[2] futex_wait res = %d\n".ptr, res);
+
+            std.println("[2] exit");
+        }, &mut futex_val).unwrap();
+
+        // join
+        libc.pthread_join(t1, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 1 joined");
+        libc.pthread_join(t2, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 2 joined");
+
+        res := futex_wake(&mut futex_val, 1);
+        libc.printf("res = %d\n".ptr, res);
+    }
+    */
+
+    /*
+    std.println("\n========== MUTEX try_lock ==========");
+    {
+        mut mutex := Mutex.{};
+
+        libc.printf("[main] mutex.is_locked = %d\n".ptr, mutex.is_locked);
+
+        // thread 1
+        t1 := spawn_with_capture((mutex: *mut Mutex) -> {
+            std.println("[1] start");
+            res := mutex.try_lock();
+            libc.printf("[1] try_lock > has lock: %s\n".ptr, switch res { Some :> "true", null :> "false" });
+            lock := res orelse return;
+            libc.sleep(1);
+            lock.unlock();
+            std.println("[1] unlocked")
+        }, &mut mutex).unwrap();
+
+        // thread 2
+        t2 := spawn_with_capture((mutex: *mut Mutex) -> {
+            std.println("[2] start");
+            res := mutex.try_lock();
+            libc.printf("[2] try_lock > has lock: %s\n".ptr, switch res { Some :> "true", null :> "false" });
+            lock := res orelse return;
+            libc.sleep(1);
+            lock.unlock();
+            std.println("[2] unlocked")
+        }, &mut mutex).unwrap();
+
+        // join
+        libc.pthread_join(t1, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 1 joined");
+        libc.pthread_join(t2, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 2 joined");
+    }
+    */
+
+    /*
+    std.println("\n========== MUTEX lock_blocking ==========");
+    {
+        mut mutex := Mutex.{};
+
+        libc.printf("[main] mutex.is_locked = %d\n".ptr, mutex.is_locked);
+
+        // thread 1
+        t1 := spawn_with_capture((mutex: *mut Mutex) -> {
+            std.println("[1] start");
+            lock := mutex.lock_blocking();
+            libc.printf("[1] lock_blocking done\n".ptr);
+            libc.sleep(3);
+            lock.unlock();
+            std.println("[1] unlocked")
+        }, &mut mutex).unwrap();
+
+        // thread 2
+        t2 := spawn_with_capture((mutex: *mut Mutex) -> {
+            std.println("[2] start");
+            lock := mutex.lock_blocking();
+            libc.printf("[2] lock_blocking done\n".ptr);
+            libc.sleep(3);
+            lock.unlock();
+            std.println("[2] unlocked")
+        }, &mut mutex).unwrap();
+
+        // join
+        libc.pthread_join(t1, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 1 joined");
+        libc.pthread_join(t2, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 2 joined");
+    }
+    */
+
+    std.println("\n========== FUTEX CHANNEL ==========");
+    // TODO
+}
+
+ThreadCreateResult :: libc.Result;
+spawn_with_capture :: (func: *mut $C -> void, capture: *mut C, attr: ?*libc.pthread_attr_t = null) -> ThreadCreateResult {
+    mut thread_id: libc.pthread_t;
+    res := libc.pthread_create(&mut thread_id, attr, xx &func, capture) |> libc.thread_result();
+    switch res { .Ok :> .Ok(thread_id) } else res
+}
+
+// memory ordering (atomics)
+// <https://www.youtube.com/watch?v=ZQFzMfHIxng>
+// <https://www.youtube.com/watch?v=rMGWeSjctlY>
+//
+// non-atomic:     memory operations might never be visible (to/from other threads)
+// atomic relaxed: memory operations on the atomic value are visible (to/from other threads)
+//                 memory operations on other values might not be visible (due to reordering)
+
+
+/*
+
+    // -------
+
+    /*
+    let code = r#"
+libc :: #import "libc";
+
+ThreadCreateResult :: libc.Result;
+
+spawn_with_capture :: (func: *(capture: *mut $T) -> void, capture: *mut $T, attr: ?*libc.pthread_attr_t = null) -> ThreadCreateResult {
+    mut thread_id: libc.pthread_t;
+    res := libc.pthread_create(&mut thread_id, attr, xx func, capture) |> libc.thread_result();
+    switch res { .Ok :> .Ok(thread_id) } else res
+}
+
+main :: -> {
+    mut futex_val: u32 = 0;
+
+    // thread 1
+    mut t1: libc.pthread_t;
+    libc.pthread_create(&mut t1, null, &(arg: ?*any) -> null, null) |> libc.thread_result().unwrap();
+
+    // thread 2
+    t2 := spawn_with_capture(&(futex_val: *mut u32) -> {}, &mut futex_val).unwrap();
+
+    // join
+    libc.pthread_join(t1, null) |> libc.thread_result().unwrap();
+    libc.pthread_join(t2, null) |> libc.thread_result().unwrap();
+}
+"#;
+    test(code).with_prelude().compile_no_err();
+    */
+ */

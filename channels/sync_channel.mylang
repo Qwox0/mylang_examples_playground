@@ -1,0 +1,941 @@
+std :: #import "std";
+libc :: #import "libc";
+futex :: #import "../futex/futex.mylang";
+
+DEBUG :: false;
+
+// spsc
+
+/*
+ChannelData :: struct($T) {
+    waiting_slot: ?*mut T = null,
+    is_closed: bool = false,
+    send_futex: u32 = FUTEX_NO_WAIT,
+    recv_futex: u32 = FUTEX_NO_WAIT,
+}
+
+FUTEX_NO_WAIT : u32 : 0;
+FUTEX_WAITING : u32 : 1;
+
+Sender :: struct($T) {
+    chan: *mut ChannelData(T);
+
+    Self :: Sender(T);
+
+    send :: (self: *mut Self, val: T) -> {
+        if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed)  std.panic("send on closed channel");
+
+        loop {
+            if DEBUG  std.assert(not std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed), "closed by other thread");
+
+            waiting_slot := std.atomic.rmw(self.*.chan.*.waiting_slot.&mut, null, .Xchg, .Relaxed);
+            switch waiting_slot {
+                Some :> {
+                    waiting_slot.* = val;
+                    std.assert(self.*.chan.*.recv_futex == FUTEX_WAITING);
+                    self.*.chan.*.recv_futex = FUTEX_NO_WAIT;
+                    futex.futex_wake(self.*.chan.*.recv_futex.&mut, 1);
+                    return;
+                },
+                null :> {
+                    self.*.chan.*.send_futex = FUTEX_WAITING;
+                    std.println("Sender waiting");
+                    std.assert(self.*.chan.*.recv_futex != FUTEX_WAITING, "deadlock (Sender)");
+                    res := futex.futex_wait(self.*.chan.*.send_futex.&mut, FUTEX_WAITING, null);
+                    if DEBUG  libc.printf("send futex_wait res = %d\n".ptr, res);
+                    res |> libc.result().unwrap();
+                }
+            }
+        }
+    }
+
+    close :: (self: *mut Self) -> {
+        std.atomic.store(self.*.chan.*.is_closed.&mut, true, .Relaxed);
+        res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, 1);
+        if DEBUG  libc.printf("close futex_wake res = %d\n".ptr, res);
+    }
+}
+Receiver :: struct($T) {
+    chan: *mut ChannelData(T);
+
+    Self :: Receiver(T);
+
+    receive :: (self: *mut Self) -> ?T {
+        if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed) return null; // closed
+
+        mut ret: T;
+
+        std.assert(self.*.chan.*.waiting_slot == null, "no other consumers");
+        std.assert(self.*.chan.*.recv_futex == FUTEX_NO_WAIT, "no other consumers");
+
+        self.*.chan.*.waiting_slot = &mut ret;
+        self.*.chan.*.recv_futex = FUTEX_WAITING;
+
+        res := futex.futex_wake(self.*.chan.*.send_futex.&mut, 1); // must Release waiting_slot!
+        if DEBUG  libc.printf("receive futex_wake res = %d\n".ptr, res);
+
+        // can't wait on waiting_slot because it is 64-bit
+        std.println("Receiver waiting");
+        //std.assert(self.*.chan.*.send_futex != FUTEX_WAITING, "deadlock (Receiver)");
+        res := futex.futex_wait(self.*.chan.*.recv_futex.&mut, FUTEX_WAITING, null);
+        if DEBUG  libc.printf("receive futex_wait res = %d\n".ptr, res);
+
+        Some(ret)
+    }
+}
+*/
+
+/*
+ChannelData :: struct($T) {
+    transfer_slot: ?*mut T = null,
+    is_closed: bool = false,
+    send_futex: u32 = FUTEX_NO_WAIT,
+    recv_futex: u32 = FUTEX_NO_WAIT,
+}
+
+FUTEX_NO_WAIT : u32 : 0;
+FUTEX_WAITING : u32 : 1;
+
+Sender :: struct($T) {
+    chan: *mut ChannelData(T);
+
+    Self :: Sender(T);
+
+    send :: (self: *mut Self, mut val: T) -> {
+        if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed)  std.panic("send on closed channel");
+
+        loop {
+            receiver_slot := std.atomic.cmpxchg_strong(self.*.chan.*.transfer_slot.&mut, null, &mut val, .Relaxed, .Relaxed);
+            switch receiver_slot {
+                null :> {
+                    // no receiver yet. we wait.
+                    std.assert(self.*.chan.*.send_futex == FUTEX_NO_WAIT, "send_futex == FUTEX_NO_WAIT");
+                    self.*.chan.*.send_futex = FUTEX_WAITING;
+
+                    libc.printf("Sender waiting\n".ptr);
+                    std.assert(self.*.chan.*.recv_futex != FUTEX_WAITING, "deadlock (Sender)");
+                    //libc.printf("send_futex = %d\n".ptr,self.*.chan.*.send_futex );
+                    res := futex.futex_wait(self.*.chan.*.send_futex.&mut, FUTEX_WAITING, null);
+                    if DEBUG  libc.printf("send futex_wait res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+                Some :> {
+                    // receiver is waiting
+                    receiver_slot := std.atomic.rmw(self.*.chan.*.transfer_slot.&mut, null, .Xchg, .Relaxed)
+                        orelse continue; // transfer_slot changed between cmpxchg and xchg
+
+                    receiver_slot.* = val;
+                    if DEBUG  libc.printf("send wrote to slot: %d\n".ptr, val);
+
+                    std.assert(self.*.chan.*.recv_futex == FUTEX_WAITING, "recv_futex == FUTEX_WAITING");
+                    self.*.chan.*.recv_futex = FUTEX_NO_WAIT;
+                    res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, 1);
+                    if DEBUG  libc.printf("send futex_wake res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+            }
+            break;
+        }
+    }
+
+    close :: (self: *mut Self) -> {
+        std.atomic.store(self.*.chan.*.is_closed.&mut, true, .Relaxed);
+        res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, 1);
+        if DEBUG  libc.printf("close futex_wake res = %d\n".ptr, res);
+    }
+}
+Receiver :: struct($T) {
+    chan: *mut ChannelData(T);
+
+    Self :: Receiver(T);
+
+    receive :: (self: *mut Self) -> ?T {
+        if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed) return null; // closed
+
+        mut ret: T;
+
+        loop {
+            sender_slot := std.atomic.cmpxchg_strong(self.*.chan.*.transfer_slot.&mut, null, &mut ret, .Relaxed, .Relaxed);
+            switch sender_slot {
+                null :> {
+                    // no sender yet. we wait.
+                    std.assert(self.*.chan.*.recv_futex == FUTEX_NO_WAIT, "recv_futex == FUTEX_NO_WAIT");
+                    self.*.chan.*.recv_futex = FUTEX_WAITING;
+
+                    libc.printf("Receiver waiting\n".ptr);
+                    std.assert(self.*.chan.*.send_futex != FUTEX_WAITING, "deadlock (Receiver)");
+                    //libc.printf("recv_futex = %d\n".ptr,self.*.chan.*.recv_futex );
+                    res := futex.futex_wait(self.*.chan.*.recv_futex.&mut, FUTEX_WAITING, null);
+                    if DEBUG  libc.printf("receive futex_wait res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+                Some :> {
+                    // sender is waiting
+                    sender_slot := std.atomic.rmw(self.*.chan.*.transfer_slot.&mut, null, .Xchg, .Relaxed)
+                            orelse continue; // transfer_slot changed between cmpxchg and xchg
+
+                    ret = sender_slot.*;
+                    if DEBUG  libc.printf("receive read from slot: %d\n".ptr, ret);
+
+                    std.assert(self.*.chan.*.send_futex == FUTEX_WAITING, "send_futex == FUTEX_WAITING");
+                    self.*.chan.*.send_futex = FUTEX_NO_WAIT;
+                    res := futex.futex_wake(self.*.chan.*.send_futex.&mut, 1);
+                    if DEBUG  libc.printf("receive futex_wake res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+            }
+            break;
+        }
+
+        Some(ret)
+    }
+}
+*/
+
+/*
+ChannelData :: struct($T) {
+    transfer_slot: ?*mut T = null,
+    is_closed: bool = false,
+    send_futex: u32 = CHAN_WAITING,
+    recv_futex: u32 = CHAN_WAITING,
+}
+
+ChannelFutexState :: enum {
+    Waiting,
+}
+
+
+CHAN_WAITING   : u32 : 0;
+CHAN_OPERATING : u32 : 1;
+CHAN_CLOSING   : u32 : 2;
+CHAN_CLOSED    : u32 : 3;
+
+SendResult :: enum {
+    Ok,
+    Closed,
+
+    unwrap :: (self: SendResult) -> switch self {
+        .Ok :> {},
+        .Closed :> std.panic("send on closed channel"),
+    };
+}
+
+Sender :: struct($T) {
+    chan: *mut ChannelData(T);
+
+    Self :: Sender(T);
+
+    send :: (self: *mut Self, mut val: T) -> SendResult {
+        if std.atomic.load(self.*.chan.*.send_futex.&mut, .Relaxed) == CHAN_CLOSED return .Closed;
+
+        loop {
+            //std.assert(self.*.chan.*.send_futex == CHAN_WAITING, "send_futex == CHAN_WAITING");
+            receiver_slot := std.atomic.cmpxchg_strong(self.*.chan.*.transfer_slot.&mut, null, &mut val, .Relaxed, .Relaxed);
+            switch receiver_slot {
+                null :> {
+                    if DEBUG libc.printf("Sender waiting: send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    blocking := std.atomic.cmpxchg_strong(self.*.chan.*.send_futex.&mut, CHAN_WAITING, CHAN_OPERATING, .Relaxed, .Relaxed) == null;
+                    if blocking  std.assert(self.*.chan.*.recv_futex != CHAN_OPERATING, "deadlock (Sender)");
+                    res := futex.futex_wait(self.*.chan.*.send_futex.&mut, CHAN_OPERATING, null);
+                    if DEBUG  libc.printf("send futex_wait res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    //res |> libc.result().unwrap();
+                };
+                Some :> {
+                    // receiver is waiting
+                    receiver_slot := std.atomic.rmw(self.*.chan.*.transfer_slot.&mut, null, .Xchg, .Acquire) // acquires `recv_futex`
+                        orelse continue; // transfer_slot changed between cmpxchg and xchg
+
+                    receiver_slot.* = val;
+                    if DEBUG  libc.printf("send wrote to slot: %d\n".ptr, val);
+
+                    std.assert(self.*.chan.*.recv_futex == CHAN_OPERATING, "recv_futex == CHAN_OPERATING");
+                    //self.*.chan.*.recv_futex = CHAN_OPERATING;
+                    res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, 1);
+                    if DEBUG  libc.printf("send futex_wake res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+            }
+            break;
+        }
+        ;.Ok
+    }
+
+    close :: (self: *mut Self) -> {
+        std.atomic.store(self.*.chan.*.is_closed.&mut, true, .Relaxed);
+        if DEBUG  libc.printf("close recv_futex = %d\n".ptr, self.*.chan.*.recv_futex);
+
+        // inactive -> closed
+        // waiting -> closing
+
+        if std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_WAITING, CHAN_CLOSED, .Relaxed, .Relaxed) == null {
+            res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, std.num.u32_MAX);
+            if DEBUG  libc.printf("close futex_wake res = %d\n".ptr, res);
+        }
+        /*
+        else if std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_OPERATING, CHAN_CLOSED, .Relaxed, .Relaxed) == null {
+            res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, std.num.u32_MAX);
+            if DEBUG  libc.printf("close futex_wake res = %d\n".ptr, res);
+        }
+        */
+    }
+}
+Receiver :: struct($T) {
+    chan: *mut ChannelData(T);
+
+    Self :: Receiver(T);
+
+    receive :: (self: *mut Self) -> ?T {
+        if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed) return null; // closed
+
+        mut ret: T;
+
+        loop {
+            //std.assert(self.*.chan.*.recv_futex == CHAN_WAITING, "recv_futex == CHAN_WAITING");
+            sender_slot := std.atomic.cmpxchg_strong(self.*.chan.*.transfer_slot.&mut, null, &mut ret, .Relaxed, .Relaxed);
+            switch sender_slot {
+                null :> {
+                    // no sender yet. we wait.
+                    if DEBUG libc.printf("Receiver waiting: send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    blocking := std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_WAITING, CHAN_OPERATING, .Relaxed, .Relaxed) == null;
+                    if blocking  std.assert(self.*.chan.*.send_futex != CHAN_OPERATING, "deadlock (Receiver)");
+                    res := futex.futex_wait(self.*.chan.*.recv_futex.&mut, CHAN_OPERATING, null);
+                    if DEBUG  libc.printf("receive futex_wait res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    //res |> libc.result().unwrap();
+
+                    if std.atomic.load(self.*.chan.*.recv_futex.&mut, .Relaxed) == CHAN_CLOSED return null; // closed
+                    //if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed) return null; // closed
+                };
+                Some :> {
+                    // sender is waiting
+                    sender_slot := std.atomic.rmw(self.*.chan.*.transfer_slot.&mut, null, .Xchg, .Acquire) // acquires `send_futex`
+                            orelse continue; // transfer_slot changed between cmpxchg and xchg
+
+                    ret = sender_slot.*;
+                    if DEBUG  libc.printf("receive read from slot: %d\n".ptr, ret);
+
+                    std.assert(self.*.chan.*.send_futex == CHAN_OPERATING, "send_futex == CHAN_OPERATING");
+                    self.*.chan.*.send_futex = CHAN_WAITING;
+                    res := futex.futex_wake(self.*.chan.*.send_futex.&mut, 1);
+                    if DEBUG  libc.printf("receive futex_wake res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+            }
+            break;
+        }
+
+        Some(ret)
+    }
+}
+*/
+
+impl1 :: struct {
+
+ChannelData :: struct($T) {
+    transfer_slot: ?*mut T = null,
+    is_closed: bool = false,
+    send_futex: u32 = CHAN_INACTIVE,
+    recv_futex: u32 = CHAN_INACTIVE,
+}
+
+ChannelFutexState :: enum {
+    Waiting,
+}
+
+
+CHAN_INACTIVE  : u32 : 0;
+CHAN_BLOCKING  : u32 : 1;
+CHAN_FINISHING : u32 : 2;
+CHAN_CLOSED    : u32 : 3;
+
+SendResult :: enum {
+    Ok,
+    Closed,
+
+    unwrap :: (self: SendResult) -> switch self {
+        .Ok :> {},
+        .Closed :> std.panic("send on closed channel"),
+    };
+}
+
+Sender :: struct($T) {
+    chan: *mut ChannelData(T);
+
+    Self :: Sender(T);
+
+    send :: (self: *mut Self, mut val: T) -> SendResult {
+        if std.atomic.load(self.*.chan.*.send_futex.&mut, .Relaxed) == CHAN_CLOSED return .Closed;
+
+        loop {
+            if DEBUG libc.printf("[send] transfer_slot = %p\n".ptr, std.atomic.load(self.*.chan.*.transfer_slot.&mut, .Relaxed));
+            //std.assert(self.*.chan.*.send_futex == CHAN_WAITING, "send_futex == CHAN_WAITING");
+            receiver_slot := std.atomic.cmpxchg_strong(self.*.chan.*.transfer_slot.&mut, null, &mut val, .Relaxed, .Relaxed);
+            if DEBUG {switch receiver_slot {
+                Some :> libc.printf("[send] receiver_slot = %p\n".ptr, receiver_slot);
+                null :> libc.printf("[send] receiver_slot = null\n".ptr);
+            };}
+            switch receiver_slot {
+                null :> {
+                    // no receiver yet. we wait.
+                    if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed) return .Closed; // closed
+
+                    if DEBUG libc.printf("Sender waiting: send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+
+                    blocking := std.atomic.cmpxchg_strong(self.*.chan.*.send_futex.&mut, CHAN_INACTIVE, CHAN_BLOCKING, .Relaxed, .Relaxed) == null;
+                    //if blocking  std.assert(self.*.chan.*.recv_futex != CHAN_BLOCKING, "deadlock (Sender)");
+                    //if blocking && self.*.chan.*.recv_futex == CHAN_BLOCKING std.println("deadlock (Sender)");
+                    res := futex.futex_wait(self.*.chan.*.send_futex.&mut, CHAN_BLOCKING, null);
+                    if DEBUG  libc.printf("send futex_wait res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    //res |> libc.result().unwrap();
+
+                    if DEBUG libc.printf("[send] 1 send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    if std.atomic.cmpxchg_strong(self.*.chan.*.send_futex.&mut, CHAN_FINISHING, CHAN_INACTIVE, .Acquire, .Relaxed) == Some(CHAN_CLOSED) {
+                        return .Closed;
+                    }
+                };
+                Some :> {
+                    // receiver is waiting
+                    receiver_slot := std.atomic.rmw(self.*.chan.*.transfer_slot.&mut, null, .Xchg, .Relaxed)
+                        orelse continue; // transfer_slot changed between cmpxchg and xchg
+
+                    receiver_slot.* = val;
+                    if DEBUG  libc.printf("send wrote to slot %p: %d\n".ptr, receiver_slot, val);
+
+                    if DEBUG libc.printf("[send] 2 send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    //std.assert(self.*.chan.*.recv_futex == CHAN_BLOCKING, "recv_futex == CHAN_BLOCKING");
+                    std.atomic.store(self.*.chan.*.recv_futex.&mut, CHAN_FINISHING, .Release);
+                    res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, 1);
+                    if DEBUG  libc.printf("send futex_wake res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+            }
+            break;
+        }
+        ;.Ok
+    }
+
+    close :: (self: *mut Self) -> {
+        std.atomic.store(self.*.chan.*.is_closed.&mut, true, .Relaxed);
+
+        if DEBUG  libc.printf("close recv_futex = %d\n".ptr, self.*.chan.*.recv_futex);
+        if std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_INACTIVE, CHAN_CLOSED, .Relaxed, .Relaxed) == null {
+            res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, std.num.u32_MAX);
+            if DEBUG  libc.printf("close futex_wake res = %d\n".ptr, res);
+        } else if std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_BLOCKING, CHAN_CLOSED, .Relaxed, .Relaxed) == null {
+            res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, std.num.u32_MAX);
+            if DEBUG  libc.printf("close futex_wake res = %d\n".ptr, res);
+        }
+        //std.assert(self.*.chan.*.send_futex == CHAN_INACTIVE, "send_futex == CHAN_INACTIVE");
+        //std.atomic.store(self.*.chan.*.send_futex.&mut, CHAN_CLOSED, .Relaxed);
+    }
+}
+Receiver :: struct($T) {
+    chan: *mut ChannelData(T);
+
+    Self :: Receiver(T);
+
+    receive :: (self: *mut Self) -> ?T {
+        if std.atomic.load(self.*.chan.*.recv_futex.&mut, .Relaxed) == CHAN_CLOSED return null; // closed
+
+        mut ret: T;
+
+        loop {
+            if DEBUG libc.printf("[receive] transfer_slot = %p\n".ptr, std.atomic.load(self.*.chan.*.transfer_slot.&mut, .Relaxed));
+            //std.assert(self.*.chan.*.recv_futex == CHAN_WAITING, "recv_futex == CHAN_WAITING");
+            sender_slot := std.atomic.cmpxchg_strong(self.*.chan.*.transfer_slot.&mut, null, &mut ret, .Relaxed, .Relaxed);
+            if DEBUG {switch sender_slot {
+                Some :> libc.printf("[receive] sender_slot   = %p\n".ptr, sender_slot);
+                null :> libc.printf("[receive] sender_slot   = null\n".ptr);
+            };}
+            switch sender_slot {
+                null :> {
+                    // no sender yet. we wait.
+                    if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed) return null; // closed
+
+                    if DEBUG libc.printf("Receiver waiting: send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+
+                    blocking := std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_INACTIVE, CHAN_BLOCKING, .Release, .Relaxed) == null;
+                    //if blocking  std.assert(self.*.chan.*.send_futex != CHAN_BLOCKING, "deadlock (Receiver)");
+                    /*
+                    if blocking && self.*.chan.*.send_futex == CHAN_BLOCKING {
+                        std.println("deadlock (Receiver)");
+                        libc.printf("send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                        std.panic("");
+                    }
+                    */
+                    res := futex.futex_wait(self.*.chan.*.recv_futex.&mut, CHAN_BLOCKING, null);
+                    if DEBUG  libc.printf("receive futex_wait res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    //res |> libc.result().unwrap();
+
+                    if DEBUG libc.printf("[receive] 1 send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    if std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_FINISHING, CHAN_INACTIVE, .Acquire, .Relaxed) == Some(CHAN_CLOSED) {
+                        return null;
+                    }
+                };
+                Some :> {
+                    // sender is waiting
+                    sender_slot := std.atomic.rmw(self.*.chan.*.transfer_slot.&mut, null, .Xchg, .Relaxed)
+                            orelse continue; // transfer_slot changed between cmpxchg and xchg
+
+                    ret = sender_slot.*;
+                    if DEBUG  libc.printf("receive read from slot %p: %d\n".ptr, sender_slot, ret);
+
+                    if DEBUG libc.printf("[receive] 2 send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    //std.assert(self.*.chan.*.send_futex == CHAN_BLOCKING, "send_futex == CHAN_BLOCKING");
+                    std.atomic.store(self.*.chan.*.send_futex.&mut, CHAN_FINISHING, .Release);
+                    res := futex.futex_wake(self.*.chan.*.send_futex.&mut, 1);
+                    if DEBUG  libc.printf("receive futex_wake res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+            }
+            break;
+        }
+
+        Some(ret)
+    }
+}
+
+sync_channel :: ($T: type, alloc := std.ctx.alloc) -> {
+    data := std.mem.alloc(ChannelData(T), alloc) orelse return null;
+    sync_channel_from(data.{})
+}
+
+sync_channel_from :: (data: *mut ChannelData($T)) -> struct { sender: Sender(T), recv: Receiver(T) }.{
+    sender=.(data),
+    recv=.(data),
+};
+}
+
+// ------------------------
+
+impl2 :: struct {
+
+ChannelData :: struct($T) {
+    transfer_slot: ?*mut T = null,
+    is_closed: bool = false,
+    send_futex: u32 = CHAN_INACTIVE,
+    recv_futex: u32 = CHAN_INACTIVE,
+}
+
+ChannelFutexState :: enum {
+    Waiting,
+}
+
+
+CHAN_INACTIVE  : u32 : 0;
+CHAN_BLOCKING  : u32 : 1;
+CHAN_FINISHING : u32 : 2;
+CHAN_CLOSED    : u32 : 3;
+
+SendResult :: enum {
+    Ok,
+    Closed,
+
+    unwrap :: (self: SendResult) -> switch self {
+        .Ok :> {},
+        .Closed :> std.panic("send on closed channel"),
+    };
+}
+
+Channel :: struct($T) {
+    chan: *mut ChannelData(T);
+
+    Self :: Channel(T);
+
+    send :: (self: *mut Self, mut val: T) -> SendResult {
+        if std.atomic.load(self.*.chan.*.send_futex.&mut, .Relaxed) == CHAN_CLOSED return .Closed;
+
+        loop {
+            if DEBUG libc.printf("[send] transfer_slot = %p\n".ptr, std.atomic.load(self.*.chan.*.transfer_slot.&mut, .Relaxed));
+            //std.assert(self.*.chan.*.send_futex == CHAN_WAITING, "send_futex == CHAN_WAITING");
+            receiver_slot := std.atomic.cmpxchg_strong(self.*.chan.*.transfer_slot.&mut, null, &mut val, .Relaxed, .Relaxed);
+            if DEBUG {switch receiver_slot {
+                Some :> libc.printf("[send] receiver_slot = %p\n".ptr, receiver_slot);
+                null :> libc.printf("[send] receiver_slot = null\n".ptr);
+            };}
+            switch receiver_slot {
+                null :> {
+                    // no receiver yet. we wait.
+                    if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed) return .Closed; // closed
+
+                    if DEBUG libc.printf("Sender waiting: send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+
+                    blocking := std.atomic.cmpxchg_strong(self.*.chan.*.send_futex.&mut, CHAN_INACTIVE, CHAN_BLOCKING, .Relaxed, .Relaxed) == null;
+                    //if blocking  std.assert(self.*.chan.*.recv_futex != CHAN_BLOCKING, "deadlock (Sender)");
+                    //if blocking && self.*.chan.*.recv_futex == CHAN_BLOCKING std.println("deadlock (Sender)");
+                    res := futex.futex_wait(self.*.chan.*.send_futex.&mut, CHAN_BLOCKING, null);
+                    if DEBUG  libc.printf("send futex_wait res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    //res |> libc.result().unwrap();
+
+                    if DEBUG libc.printf("[send] 1 send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    if std.atomic.cmpxchg_strong(self.*.chan.*.send_futex.&mut, CHAN_FINISHING, CHAN_INACTIVE, .Acquire, .Relaxed) == Some(CHAN_CLOSED) {
+                        return .Closed;
+                    }
+                };
+                Some :> {
+                    // receiver is waiting
+                    receiver_slot := std.atomic.rmw(self.*.chan.*.transfer_slot.&mut, null, .Xchg, .Relaxed)
+                        orelse continue; // transfer_slot changed between cmpxchg and xchg
+
+                    receiver_slot.* = val;
+                    if DEBUG  libc.printf("send wrote to slot %p: %d\n".ptr, receiver_slot, val);
+
+                    if DEBUG libc.printf("[send] 2 send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    //std.assert(self.*.chan.*.recv_futex == CHAN_BLOCKING, "recv_futex == CHAN_BLOCKING");
+                    std.atomic.store(self.*.chan.*.recv_futex.&mut, CHAN_FINISHING, .Release);
+                    res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, 1);
+                    if DEBUG  libc.printf("send futex_wake res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+            }
+            break;
+        }
+        ;.Ok
+    }
+
+    receive :: (self: *mut Self) -> ?T {
+        if std.atomic.load(self.*.chan.*.recv_futex.&mut, .Relaxed) == CHAN_CLOSED return null; // closed
+
+        mut ret: T;
+
+        loop {
+            if DEBUG libc.printf("[receive] transfer_slot = %p\n".ptr, std.atomic.load(self.*.chan.*.transfer_slot.&mut, .Relaxed));
+            //std.assert(self.*.chan.*.recv_futex == CHAN_WAITING, "recv_futex == CHAN_WAITING");
+            sender_slot := std.atomic.cmpxchg_strong(self.*.chan.*.transfer_slot.&mut, null, &mut ret, .Relaxed, .Relaxed);
+            if DEBUG {switch sender_slot {
+                Some :> libc.printf("[receive] sender_slot   = %p\n".ptr, sender_slot);
+                null :> libc.printf("[receive] sender_slot   = null\n".ptr);
+            };}
+            switch sender_slot {
+                null :> {
+                    // no sender yet. we wait.
+                    if std.atomic.load(self.*.chan.*.is_closed.&mut, .Relaxed) return null; // closed
+
+                    if DEBUG libc.printf("Receiver waiting: send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+
+                    blocking := std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_INACTIVE, CHAN_BLOCKING, .Release, .Relaxed) == null;
+                    //if blocking  std.assert(self.*.chan.*.send_futex != CHAN_BLOCKING, "deadlock (Receiver)");
+                    /*
+                    if blocking && self.*.chan.*.send_futex == CHAN_BLOCKING {
+                        std.println("deadlock (Receiver)");
+                        libc.printf("send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                        std.panic("");
+                    }
+                    */
+                    res := futex.futex_wait(self.*.chan.*.recv_futex.&mut, CHAN_BLOCKING, null);
+                    if DEBUG  libc.printf("receive futex_wait res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    //res |> libc.result().unwrap();
+
+                    if DEBUG libc.printf("[receive] 1 send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    if std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_FINISHING, CHAN_INACTIVE, .Acquire, .Relaxed) == Some(CHAN_CLOSED) {
+                        return null;
+                    }
+                };
+                Some :> {
+                    // sender is waiting
+                    sender_slot := std.atomic.rmw(self.*.chan.*.transfer_slot.&mut, null, .Xchg, .Relaxed)
+                            orelse continue; // transfer_slot changed between cmpxchg and xchg
+
+                    ret = sender_slot.*;
+                    if DEBUG  libc.printf("receive read from slot %p: %d\n".ptr, sender_slot, ret);
+
+                    if DEBUG libc.printf("[receive] 2 send_futex = %d; recv_futex = %d\n".ptr, self.*.chan.*.send_futex, self.*.chan.*.recv_futex);
+                    //std.assert(self.*.chan.*.send_futex == CHAN_BLOCKING, "send_futex == CHAN_BLOCKING");
+                    std.atomic.store(self.*.chan.*.send_futex.&mut, CHAN_FINISHING, .Release);
+                    res := futex.futex_wake(self.*.chan.*.send_futex.&mut, 1);
+                    if DEBUG  libc.printf("receive futex_wake res = %d; slot = %p\n".ptr, res, self.*.chan.*.transfer_slot);
+                    res |> libc.result().unwrap();
+                };
+            }
+            break;
+        }
+
+        Some(ret)
+    }
+
+    close :: (self: *mut Self) -> {
+        std.atomic.store(self.*.chan.*.is_closed.&mut, true, .Relaxed);
+
+        if std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_INACTIVE, CHAN_CLOSED, .Relaxed, .Relaxed) == null {
+            res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, std.num.u32_MAX);
+            if DEBUG  libc.printf("close futex_wake res = %d\n".ptr, res);
+        } else if std.atomic.cmpxchg_strong(self.*.chan.*.recv_futex.&mut, CHAN_BLOCKING, CHAN_CLOSED, .Relaxed, .Relaxed) == null {
+            res := futex.futex_wake(self.*.chan.*.recv_futex.&mut, std.num.u32_MAX);
+            if DEBUG  libc.printf("close futex_wake res = %d\n".ptr, res);
+        }
+    }
+}
+
+Sender :: Channel;
+Receiver :: Channel;
+
+sync_channel :: ($T: type, alloc := std.ctx.alloc) -> {
+    data := std.mem.alloc(ChannelData(T), alloc) orelse return null;
+    sync_channel_from(data.{})
+}
+
+sync_channel_from :: (data: *mut ChannelData($T)) -> struct { sender: Sender(T), recv: Receiver(T) }.{
+    sender=.(data),
+    recv=.(data),
+};
+}
+
+// ------------------------
+
+
+main :: -> {
+    test(impl1);
+    test(impl2);
+    //test(impl3);
+
+    bench(impl1);
+    bench(impl2);
+    //bench(impl3);
+}
+
+test :: ($impl: type) -> {
+    std.println("\n========== SEND FIRST ==========");
+    {
+        mut chan := impl.sync_channel([]u8) orelse std.panic("oom");
+
+        // thread 1
+        t1 := futex.spawn_with_capture((recv: *mut impl.Receiver([]u8)) -> {
+            std.println("[1] start");
+
+            libc.usleep(100_000);
+            std.println("[1] sleep done");
+
+            std.println("[1] receiving ...");
+            val := recv.receive() orelse std.panic("receive error");
+            libc.printf("[1] received: %.*s\n".ptr, val.len, val.ptr);
+
+            std.println("[1] exit");
+        }, chan.recv.&mut).unwrap();
+
+        // thread 2
+        t2 := futex.spawn_with_capture((sender: *mut impl.Sender([]u8)) -> {
+            defer sender.close();
+            std.println("[2] start");
+
+            std.println("[2] sending ...");
+            sender.send("Hello World");// orelse std.panic("send error");
+
+            std.println("[2] exit");
+        }, chan.sender.&mut).unwrap();
+
+        // join
+        libc.pthread_join(t1, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 1 joined");
+        libc.pthread_join(t2, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 2 joined");
+    }
+
+    std.println("\n========== RECV FIRST; CLOSE AFTER RECV DONE ==========");
+    {
+        mut chan := impl.sync_channel([]u8) orelse std.panic("oom");
+
+        // thread 1
+        t1 := futex.spawn_with_capture((recv: *mut impl.Receiver([]u8)) -> {
+            std.println("[1] start");
+
+            std.println("[1] receiving ...");
+            val := recv.receive() orelse std.panic("receive error");
+            libc.printf("[1] received: %.*s\n".ptr, val.len, val.ptr);
+
+            std.println("[1] exit");
+        }, chan.recv.&mut).unwrap();
+
+        // thread 2
+        t2 := futex.spawn_with_capture((sender: *mut impl.Sender([]u8)) -> {
+            defer sender.close();
+            std.println("[2] start");
+
+            libc.usleep(100_000);
+            std.println("[2] sleep done");
+
+            std.println("[2] sending ...");
+            sender.send("Hello World");// orelse std.panic("send error");
+
+            libc.usleep(100_000);
+            std.println("[2] exit");
+        }, chan.sender.&mut).unwrap();
+
+        // join
+        libc.pthread_join(t1, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 1 joined");
+        libc.pthread_join(t2, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 2 joined");
+    }
+
+    std.println("\n========== RECV FIRST; CLOSE WHILE RECV ==========");
+    {
+        mut chan := impl.sync_channel([]u8) orelse std.panic("oom");
+
+        // thread 1
+        t1 := futex.spawn_with_capture((recv: *mut impl.Receiver([]u8)) -> {
+            std.println("[1] start");
+
+            std.println("[1] receiving ...");
+            val := recv.receive() orelse std.panic("receive error");
+            libc.printf("[1] received: %.*s\n".ptr, val.len, val.ptr);
+
+            std.println("[1] exit");
+        }, chan.recv.&mut).unwrap();
+
+        // thread 2
+        t2 := futex.spawn_with_capture((sender: *mut impl.Sender([]u8)) -> {
+            defer sender.close();
+            std.println("[2] start");
+
+            libc.usleep(100_000);
+            std.println("[2] sleep done");
+
+            std.println("[2] sending ...");
+            sender.send("Hello World");// orelse std.panic("send error");
+
+            std.println("[2] exit");
+        }, chan.sender.&mut).unwrap();
+
+        // join
+        libc.pthread_join(t1, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 1 joined");
+        libc.pthread_join(t2, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 2 joined");
+    }
+
+    std.println("\n========== CLOSE BEFORE RECV ==========");
+    {
+        mut chan := impl.sync_channel([]u8) orelse std.panic("oom");
+
+        // thread 1
+        t1 := futex.spawn_with_capture((recv: *mut impl.Receiver([]u8)) -> {
+            std.println("[1] start");
+
+            std.println("[1] receiving ...");
+            val := recv.receive();
+            std.assert(switch val { null :> true } else false, "receive must return null");
+            libc.printf("[1] received: null\n".ptr);
+
+            std.println("[1] exit");
+        }, chan.recv.&mut).unwrap();
+
+        // thread 2
+        t2 := futex.spawn_with_capture((sender: *mut impl.Sender([]u8)) -> {
+            defer sender.close();
+            std.println("[2] start");
+            std.println("[2] exit");
+        }, chan.sender.&mut).unwrap();
+
+        // join
+        libc.pthread_join(t1, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 1 joined");
+        libc.pthread_join(t2, null) |> libc.thread_result().unwrap();
+        std.println("[main] thread 2 joined");
+    }
+
+    std.println("\n========== SUMMING ==========");
+    {
+        mut chan := impl.sync_channel(i64) orelse std.panic("oom");
+
+        // Senders
+        SENDERS :: 1; // single producer!
+        mut senders := u64.[0; SENDERS];
+        for sender_idx in 0..SENDERS {
+            t_id := futex.spawn_with_capture((sender: *mut impl.Sender(i64)) -> {
+                for i in 1..=10 {
+                    libc.usleep(5_000);
+                    sender.send(i);
+                }
+                sender.close();
+                if DEBUG  std.println("sender exited");
+            }, chan.sender.&mut).unwrap();
+            senders[sender_idx] = t_id;
+            //libc.pthread_setname_np(t_id, "sender".ptr);
+        }
+
+        // Accumulator
+        acc_t := futex.spawn_with_capture((recv: *mut impl.Receiver(i64)) -> {
+            mut acc := 0;
+            loop {
+                val := recv.receive() orelse break;
+                acc += val;
+                libc.usleep(5_000);
+                //libc.printf("acc = %d\n".ptr, acc);
+            }
+            libc.printf("final result = %d\n".ptr, acc);
+        }, chan.recv.&mut).unwrap();
+        //libc.pthread_setname_np(t_id, "accumulator".ptr);
+
+        // join
+        for thread in senders[..] {
+            libc.pthread_join(thread, null) |> libc.thread_result().unwrap();
+        }
+        libc.pthread_join(acc_t, null) |> libc.thread_result().unwrap();
+    }
+}
+
+bench :: ($impl: type) -> {
+    std.println("\n========== BENCH ==========");
+    mut alloc_buf := u8.[0; 1024 * 1024];
+    mut alloc := std.mem.FixedArenaAllocator.new(alloc_buf[..]mut);
+
+    BENCH_COUNT :: 50;
+    CHANNEL_USES_PER_BENCH :: 10_000;
+
+    {
+        mut acc := 0;
+        mut rng := std.rng.Sfc64.new(1);
+        for _ in 0..CHANNEL_USES_PER_BENCH  acc += (rng.&mut.next() & 0xfff).as(i64);
+        libc.printf("expected = %d\n".ptr, acc);
+    }
+
+    mut bench_results := std.Array(f32).EMPTY;
+    for _ in 0..BENCH_COUNT {
+        if DEBUG  std.println("\nstart bench iter");
+        zero(alloc_buf[..]mut);
+        alloc := alloc.&mut.allocator();
+
+        now := std.time.now();
+
+        mut chan := impl.sync_channel(i64, alloc) orelse std.panic("oom");
+
+        sender_t := futex.spawn_with_capture((sender: *mut impl.Sender(i64)) -> {
+            mut rng := std.rng.Sfc64.new(1);
+
+            for _ in 0..CHANNEL_USES_PER_BENCH  sender.send((rng.&mut.next() & 0xfff).as(i64));
+            sender.close();
+        }, chan.sender.&mut).unwrap();
+
+        receiver_t := futex.spawn_with_capture((recv: *mut impl.Receiver(i64)) -> {
+            mut acc := 0;
+            loop {
+                val := recv.receive() orelse break;
+                if DEBUG  libc.printf("val = %d\n".ptr, val);
+                acc += val;
+                //libc.printf("acc = %d\n".ptr, acc);
+            }
+            if DEBUG or acc != 20313027 then libc.printf("final result = %d\n".ptr, acc);
+            std.assert(acc == 20313027, "expected 20313027");
+        }, chan.recv.&mut).unwrap();
+
+        // join
+        libc.pthread_join(sender_t, null) |> libc.thread_result().unwrap();
+        libc.pthread_join(receiver_t, null) |> libc.thread_result().unwrap();
+
+        bench_results.&mut.push(now.elapsed().as_secs_f(), std.ctx.alloc);
+    }
+    libc.printf("bench ok.\n".ptr);
+    bench_results.&mut.sort_unstable(&(l, r) -> if l.* > r.*  1 else if l.* < r.* then -1 else 0);
+    bench_results := bench_results.&.as_slice();
+
+    libc.printf("min    = %f ms\n".ptr, bench_results[0] * 1000);
+    libc.printf("median = %f ms\n".ptr, bench_results[BENCH_COUNT / 2 - 1] * 1000);
+    libc.printf("90%%    = %f ms\n".ptr, bench_results[BENCH_COUNT * 90 / 100 - 1] * 1000);
+    libc.printf("99%%    = %f ms\n".ptr, bench_results[BENCH_COUNT * 99 / 100 - 1] * 1000);
+    libc.printf("max    = %f ms\n".ptr, bench_results[BENCH_COUNT - 1] * 1000);
+}
+
+zero :: (slice: []mut u8) -> {
+    libc.memset(slice.ptr, 0, slice.len);
+}
+
+// mpmc
